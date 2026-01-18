@@ -3,42 +3,67 @@ from bs4 import BeautifulSoup
 import csv
 import math
 import os
+import time
 from datetime import date
+from tqdm import tqdm
 
-# URLs
+# ======================
+# Configuration
+# ======================
+
 BASE_URL = "https://tpr.fmcsa.dot.gov"
-PAGE_URL = BASE_URL + "/Provider/InReview"
-API_URL = BASE_URL + "/api/Public/InReviewPublic"
+PAGE_URL = f"{BASE_URL}/Provider/InReview"
+API_URL = f"{BASE_URL}/api/Public/InReviewPublic"
 
-# Ensure outputs folder exists
-os.makedirs("outputs", exist_ok=True)
+OUTPUT_DIR = "outputs"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Files
-master_csv = os.path.join("outputs", "master_fmcsa.csv")
-snapshot_csv = os.path.join("outputs", f"fmcsa_in_review_{date.today()}.csv")
+TODAY = date.today().strftime("%Y-%m-%d")
+SNAPSHOT_CSV = os.path.join(OUTPUT_DIR, f"fmcsa_in_review_{TODAY}.csv")
+MASTER_CSV = os.path.join(OUTPUT_DIR, "master_fmcsa_in_review.csv")
 
-# Session for requests
+PAGE_SIZE = 100
+MAX_RETRIES = 5
+RETRY_SLEEP = 3
+PAGE_SLEEP = 0.5
+
+# ======================
+# Session
+# ======================
+
 session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json"
+})
+
+# ======================
+# Helpers
+# ======================
 
 def get_verification_token():
-    """Fetch the HTML page and extract CSRF __RequestVerificationToken."""
-    print("Fetching page to extract CSRF token...")
-    r = session.get(PAGE_URL)
+    """Extract CSRF token from the In Review Providers page."""
+    print("🔐 Fetching CSRF token...")
+    r = session.get(PAGE_URL, timeout=30)
     r.raise_for_status()
+
     soup = BeautifulSoup(r.text, "html.parser")
     token_input = soup.find("input", {"name": "__RequestVerificationToken"})
+
     if not token_input:
-        raise ValueError("Could not find __RequestVerificationToken in page HTML!")
+        raise RuntimeError("CSRF token not found on In Review page")
+
     return token_input["value"]
 
+
 def fetch_page(start, length, token):
-    """Fetch one page of results using the DataTables API."""
+    """Fetch a single page from the InReviewPublic API with retries."""
+
     payload = {
         "draw": 1,
         "start": start,
         "length": length,
         "order[0][column]": 2,
-        "order[0][orderable]": "true",
         "order[0][dir]": "desc",
         "columns[0][data]": "Name",
         "columns[1][data]": "City",
@@ -50,65 +75,99 @@ def fetch_page(start, length, token):
     headers = {
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "X-Requested-With": "XMLHttpRequest",
+        "Referer": PAGE_URL,
     }
 
-    r = session.post(API_URL, data=payload, headers=headers)
-    r.raise_for_status()
-    return r.json()
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = session.post(
+                API_URL,
+                data=payload,
+                headers=headers,
+                timeout=30,
+            )
 
-def save_csv(rows, output_file):
-    """Save rows to a CSV file."""
-    # Union of all keys
-    all_keys = set()
-    for row in rows:
-        all_keys.update(row.keys())
-    fieldnames = sorted(all_keys)
+            if r.status_code == 500:
+                print(f"⚠️ 500 error (attempt {attempt}/{MAX_RETRIES}) — retrying...")
+                time.sleep(RETRY_SLEEP)
+                continue
 
-    with open(output_file, "w", newline="", encoding="utf-8") as f:
+            r.raise_for_status()
+            return r.json()
+
+        except requests.exceptions.RequestException as e:
+            print(f"⚠️ Request failed (attempt {attempt}/{MAX_RETRIES}): {e}")
+            time.sleep(RETRY_SLEEP)
+
+    raise RuntimeError("FMCSA InReviewPublic API failed after all retries")
+
+
+def save_csv(rows, path):
+    """Write rows to CSV with dynamic columns."""
+    if not rows:
+        print(f"⚠️ No rows to write: {path}")
+        return
+
+    fieldnames = sorted({k for row in rows for k in row.keys()})
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
-    print(f"Saved CSV to: {output_file}")
+    print(f"💾 Saved: {path}")
+
+# ======================
+# Main
+# ======================
 
 def main():
     token = get_verification_token()
 
-    print("Fetching first page to determine total rows...")
-    page_size = 10
-    first = fetch_page(start=0, length=page_size, token=token)
-    total_records = first["recordsTotal"]
-    print(f"Total records: {total_records}")
+    print("📥 Fetching first page...")
+    first_page = fetch_page(start=0, length=10, token=token)
 
-    total_pages = math.ceil(total_records / page_size)
-    all_rows = first["data"]
+    total_records = first_page.get("recordsTotal", 0)
+    print(f"📊 Total in-review providers: {total_records}")
 
-    # Fetch remaining pages
-    for page in range(1, total_pages):
-        print(f"Fetching page {page+1}/{total_pages}...")
-        start = page * page_size
-        page_json = fetch_page(start=start, length=page_size, token=token)
-        all_rows.extend(page_json["data"])
+    total_pages = math.ceil(total_records / PAGE_SIZE)
+    all_rows = first_page.get("data", [])
 
-    print(f"Total rows downloaded: {len(all_rows)}")
+    for page in tqdm(range(1, total_pages), desc="Fetching in-review pages"):
+        start = page * PAGE_SIZE
+        page_json = fetch_page(start=start, length=PAGE_SIZE, token=token)
+        all_rows.extend(page_json.get("data", []))
+        time.sleep(PAGE_SLEEP)
 
-    # Save weekly snapshot
-    save_csv(all_rows, snapshot_csv)
+    print(f"✅ Downloaded {len(all_rows)} in-review providers")
 
-    # Update master CSV
+    # --- Save snapshot ---
+    save_csv(all_rows, SNAPSHOT_CSV)
+
+    # --- Update master ---
     master_rows = []
-    if os.path.exists(master_csv):
-        with open(master_csv, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            master_rows = list(reader)
+    if os.path.exists(MASTER_CSV):
+        with open(MASTER_CSV, "r", encoding="utf-8") as f:
+            master_rows = list(csv.DictReader(f))
 
-    # Add new rows to master if not already present
-    existing_ids = {row.get("USDOTNumber") for row in master_rows if "USDOTNumber" in row}
-    for row in all_rows:
-        if row.get("USDOTNumber") not in existing_ids:
-            master_rows.append(row)
+    existing_ids = {
+        r.get("USDOTNumber")
+        for r in master_rows
+        if r.get("USDOTNumber")
+    }
 
-    save_csv(master_rows, master_csv)
+    new_rows = [
+        row for row in all_rows
+        if row.get("USDOTNumber") and row.get("USDOTNumber") not in existing_ids
+    ]
+
+    if new_rows:
+        master_rows.extend(new_rows)
+        save_csv(master_rows, MASTER_CSV)
+        print(f"➕ Added {len(new_rows)} new providers to master file")
+    else:
+        print("ℹ️ No new providers to add to master file")
+
 
 if __name__ == "__main__":
     main()
