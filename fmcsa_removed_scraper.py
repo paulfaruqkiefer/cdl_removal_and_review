@@ -7,16 +7,29 @@ import time
 from datetime import date
 from tqdm import tqdm
 
-# --- URLs for Removed Providers ---
-BASE_URL = "https://tpr.fmcsa.dot.gov"
-PAGE_URL = BASE_URL + "/Provider/Removed"
-API_URL = BASE_URL + "/api/Public/RemovedPublic"
+# ======================
+# Configuration
+# ======================
 
-# --- Files & Directories ---
-os.makedirs("outputs", exist_ok=True)
-today = date.today().strftime("%Y-%m-%d")
-snapshot_csv = os.path.join("outputs", f"fmcsa_removed_{today}.csv")
-master_csv = os.path.join("outputs", "master_fmcsa_removed.csv")
+BASE_URL = "https://tpr.fmcsa.dot.gov"
+PAGE_URL = f"{BASE_URL}/Provider/Removed"
+API_URL = f"{BASE_URL}/api/Public/RemovedPublic"
+
+OUTPUT_DIR = "outputs"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+TODAY = date.today().strftime("%Y-%m-%d")
+SNAPSHOT_CSV = os.path.join(OUTPUT_DIR, f"fmcsa_removed_{TODAY}.csv")
+MASTER_CSV = os.path.join(OUTPUT_DIR, "master_fmcsa_removed.csv")
+
+PAGE_SIZE = 100
+MAX_RETRIES = 5
+RETRY_SLEEP = 3
+PAGE_SLEEP = 0.5
+
+# ======================
+# Session
+# ======================
 
 session = requests.Session()
 session.headers.update({
@@ -24,23 +37,27 @@ session.headers.update({
     "Accept": "application/json"
 })
 
+# ======================
+# Helpers
+# ======================
 
 def get_verification_token():
-    """Extract CSRF token from the Removed page."""
-    print("Fetching page to extract CSRF token...")
+    """Extract CSRF token from the Removed Providers page."""
+    print("🔐 Fetching CSRF token...")
     r = session.get(PAGE_URL, timeout=30)
     r.raise_for_status()
 
     soup = BeautifulSoup(r.text, "html.parser")
     token_input = soup.find("input", {"name": "__RequestVerificationToken"})
+
     if not token_input:
-        raise RuntimeError("Could not find CSRF token on Removed page")
+        raise RuntimeError("CSRF token not found on Removed Providers page")
 
     return token_input["value"]
 
 
-def fetch_page(start, length, token, retries=5, sleep=3):
-    """Fetch one page via the RemovedPublic DataTables API (with retries)."""
+def fetch_page(start, length, token):
+    """Fetch a single page from the RemovedPublic API with retries."""
 
     payload = {
         "draw": 1,
@@ -59,80 +76,81 @@ def fetch_page(start, length, token, retries=5, sleep=3):
     headers = {
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "X-Requested-With": "XMLHttpRequest",
-        "Referer": PAGE_URL
+        "Referer": PAGE_URL,
     }
 
-    for attempt in range(1, retries + 1):
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
             r = session.post(
                 API_URL,
                 data=payload,
                 headers=headers,
-                timeout=30
+                timeout=30,
             )
 
             if r.status_code == 500:
-                print(f"⚠️ 500 error (attempt {attempt}/{retries}) — retrying...")
-                time.sleep(sleep)
+                print(f"⚠️ 500 error (attempt {attempt}/{MAX_RETRIES}) — retrying...")
+                time.sleep(RETRY_SLEEP)
                 continue
 
             r.raise_for_status()
             return r.json()
 
         except requests.exceptions.RequestException as e:
-            print(f"⚠️ Request failed (attempt {attempt}/{retries}): {e}")
-            time.sleep(sleep)
+            print(f"⚠️ Request failed (attempt {attempt}/{MAX_RETRIES}): {e}")
+            time.sleep(RETRY_SLEEP)
 
-    raise RuntimeError("FMCSA Removed API failed after multiple retries")
+    raise RuntimeError("FMCSA RemovedPublic API failed after all retries")
 
 
-def save_to_csv(rows, output_file):
-    """Write rows to a CSV file."""
-    all_keys = set()
-    for row in rows:
-        all_keys.update(row.keys())
+def save_csv(rows, path):
+    """Write rows to CSV with dynamic columns."""
+    if not rows:
+        print(f"⚠️ No rows to write: {path}")
+        return
 
-    fieldnames = sorted(all_keys)
+    fieldnames = sorted({k for row in rows for k in row.keys()})
 
-    with open(output_file, "w", newline="", encoding="utf-8") as f:
+    with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
-    print(f"Saved CSV: {output_file}")
+    print(f"💾 Saved: {path}")
 
+
+# ======================
+# Main
+# ======================
 
 def main():
     token = get_verification_token()
 
-    print("Fetching first Removed page...")
-    first = fetch_page(start=0, length=10, token=token)
-    total_records = first.get("recordsTotal", 0)
+    print("📥 Fetching first page...")
+    first_page = fetch_page(start=0, length=10, token=token)
 
-    print(f"Total removed records: {total_records}")
+    total_records = first_page.get("recordsTotal", 0)
+    print(f"📊 Total removed providers: {total_records}")
 
-    page_size = 100
-    total_pages = math.ceil(total_records / page_size)
+    total_pages = math.ceil(total_records / PAGE_SIZE)
+    all_rows = first_page.get("data", [])
 
-    all_rows = first["data"]
+    for page in tqdm(range(1, total_pages), desc="Fetching removed pages"):
+        start = page * PAGE_SIZE
+        page_json = fetch_page(start=start, length=PAGE_SIZE, token=token)
+        all_rows.extend(page_json.get("data", []))
+        time.sleep(PAGE_SLEEP)
 
-    for i in tqdm(range(1, total_pages), desc="Fetching removed pages"):
-        start = i * page_size
-        page_json = fetch_page(start=start, length=page_size, token=token)
-        all_rows.extend(page_json["data"])
-        time.sleep(0.5)  # polite pacing
+    print(f"✅ Downloaded {len(all_rows)} removed providers")
 
-    print(f"Downloaded {len(all_rows)} removed records.")
+    # --- Save snapshot ---
+    save_csv(all_rows, SNAPSHOT_CSV)
 
-    # --- Save weekly snapshot ---
-    save_to_csv(all_rows, snapshot_csv)
-
-    # --- Update master file ---
+    # --- Update master ---
     master_rows = []
-    if os.path.exists(master_csv):
-        with open(master_csv, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            master_rows = list(reader)
+    if os.path.exists(MASTER_CSV):
+        with open(MASTER_CSV, "r", encoding="utf-8") as f:
+            master_rows = list(csv.DictReader(f))
 
     existing_ids = {
         r.get("ProviderNumber")
@@ -140,15 +158,17 @@ def main():
         if r.get("ProviderNumber")
     }
 
-    new_count = 0
-    for row in all_rows:
-        pid = row.get("ProviderNumber")
-        if pid and pid not in existing_ids:
-            master_rows.append(row)
-            new_count += 1
+    new_rows = [
+        row for row in all_rows
+        if row.get("ProviderNumber") and row.get("ProviderNumber") not in existing_ids
+    ]
 
-    save_to_csv(master_rows, master_csv)
-    print(f"Added {new_count} new providers to master file.")
+    if new_rows:
+        master_rows.extend(new_rows)
+        save_csv(master_rows, MASTER_CSV)
+        print(f"➕ Added {len(new_rows)} new providers to master file")
+    else:
+        print("ℹ️ No new providers to add to master file")
 
 
 if __name__ == "__main__":
